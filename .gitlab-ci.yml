@@ -1,0 +1,107 @@
+image: docker:19.03
+services:
+  - name: docker:19.03-dind
+    alias: docker
+    command: ["--tls=false"]
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_DRIVER: overlay2
+  IMAGE_TAG: $CI_COMMIT_BRANCH
+  DOCKER_TLS_CERTDIR: ""
+  HELM_IMAGE: "alpine-helm:1.0.2-1"
+  RUN_IMAGE: "runmode_image:1.3.0"
+  HELM_SIGN_OPTS: ""
+  STR_HELM_VERSION: "0.1.0"
+  TARGET_REPO: $NEXUS_DOCKER_DEVELOPMENT
+  converted: $(echo "${CI_PROJECT_NAME}-${CI_COMMIT_BRANCH}" | tr '[:upper:]' '[:lower:]')
+stages:
+  - build
+  - test
+  - package
+  - release
+  - deploy
+build:
+  stage: build
+  only:
+    changes:
+      - docker/*
+  script:
+    - docker login -u $NEXUS_USERNAME -p $NEXUS_PASSWORD $NEXUS_DOCKER_DEVELOPMENT
+    - docker login -u $NEXUS_USERNAME -p $NEXUS_PASSWORD $NEXUS_DOCKER_PROXY
+    - converted=$(echo "${CI_PROJECT_NAME}-${CI_COMMIT_BRANCH}" | tr '[:upper:]' '[:lower:]')
+    - docker build -t $converted ./docker
+    - docker tag ${converted}:latest ${TARGET_REPO}/${converted}
+    - docker push ${TARGET_REPO}/${converted}
+test: 
+  stage: test
+  script:
+    - docker login -u $NEXUS_USERNAME -p $NEXUS_PASSWORD $NEXUS_DOCKER_DEVELOPMENT
+    - converted=$(echo "${CI_PROJECT_NAME}-${CI_COMMIT_BRANCH}" | tr '[:upper:]' '[:lower:]')
+    - docker run --name adv-nginx -d -p 8080:80 ${TARGET_REPO}/$converted
+    - sleep 5s
+
+package-helm:
+  image: $NEXUS_DOCKER_PROXY/$HELM_IMAGE
+  stage: package
+  artifacts:
+    paths:
+      - ./*.tgz
+  script:
+    - BRANCH=$(echo $CI_COMMIT_BRANCH | sed 's/-/./')
+    - STR_HELM_VERSION=$STR_HELM_VERSION-$BRANCH+sha.$CI_COMMIT_SHA
+    - helm repo add HELM-DEV --username $NEXUS_USERNAME  --password $NEXUS_PASSWORD https://nexus.bigdata4biz.com/repository/dibuco_dev.helm/
+    - helm repo update
+    - helm package . $HELM_SIGN_OPTS --version $STR_HELM_VERSION
+
+
+release-helm:
+  image:
+    name: $NEXUS_DOCKER_PROXY/$HELM_IMAGE
+  stage: release
+  dependencies:
+    - "package-helm"
+  script:
+    - URL_TARGET_REPO=$URL_NEXUS_DEVELOPMENT_HELM
+    - "curl -v --upload-file *.tgz -u $NEXUS_USERNAME:$NEXUS_PASSWORD $HOST_NEXUS'repository/'$URL_TARGET_REPO/"
+
+
+deploy_helm:
+  image: $NEXUS_DOCKER_PROXY/$RUN_IMAGE
+  stage: deploy
+  script:
+    - helm repo add ${CI_PROJECT_NAME,,} --force-update --username $NEXUS_USERNAME --password $NEXUS_PASSWORD $HOST_NEXUS'repository/'$URL_NEXUS_DEVELOPMENT_HELM
+    - TARGET_NAMESPACE=$(echo ${CI_PROJECT_NAME,,}-${CI_COMMIT_BRANCH,,} |  sed 's/_/-/')
+    - DOCKER_SERVER="$NEXUS_DOCKER_DEVELOPMENT"
+    - DEFAULT_DOCKER_TAG=latest
+    - NODEZONE="${NODEZONE_DEV:=dev}"
+    - PROJECTKEY="p-6rprl"
+    - KUBECONFIG_DEV=$KUBECONFIG_DEV
+    - cat $KUBECONFIG_DEV >> $HOME/.kube/config
+    - chmod 600 $HOME/.kube/config
+    - cat $NAMESPACE_YAML >> ./namespace.yml
+    - sed "s/PROJECTKEY/$PROJECTKEY/g" ./namespace.yml -i
+    - sed "s/NS-NAME/$TARGET_NAMESPACE/g" ./namespace.yml -i
+    - sed "s/NODE/$NODEZONE/g" ./namespace.yml -i
+    - kubectl apply -f ./namespace.yml
+    - kubectl -n $TARGET_NAMESPACE delete secret regcred --ignore-not-found
+    - kubectl -n $TARGET_NAMESPACE delete secret regcred-proxy --ignore-not-found
+    - kubectl -n $TARGET_NAMESPACE create secret docker-registry regcred --docker-server=${DOCKER_SERVER} --docker-username=$NEXUS_USERNAME --docker-password=$NEXUS_PASSWORD
+    - kubectl -n $TARGET_NAMESPACE create secret docker-registry regcred-proxy --docker-server=${NEXUS_DOCKER_PROXY} --docker-username=$NEXUS_USERNAME --docker-password=$NEXUS_PASSWORD
+    - PROJECT_NAME=$(echo ${CI_PROJECT_NAME,,} | sed 's/_/-/')
+    - |
+        helm upgrade \
+        --force \
+        -i \
+        $PROJECT_NAME-${CI_COMMIT_BRANCH} \
+        -n $TARGET_NAMESPACE ${VALUE_STATUS:=--reset-values} \
+        --cleanup-on-fail \
+        --set image.repository=${DOCKER_SERVER}/${CI_PROJECT_NAME}-${CI_COMMIT_BRANCH} \
+        --set "image.tag=latest" \
+        --set ingress.hosts[0].host=${CI_COMMIT_BRANCH}.dibuco.de \
+        --set ingress.tls[0].secretName=${CI_COMMIT_BRANCH}-tls \
+        --set ingress.tls[0].hosts[0]=${CI_COMMIT_BRANCH}.dibuco.de \
+        --set ingress.hosts[0].paths[0].pathType=ImplementationSpecific \
+        --set ingress.hosts[0].paths[0].path=/ \
+        --set ingress.hosts[0].paths[1].pathType=Prefix \
+        --set ingress.hosts[0].paths[1].path=/ \
+        --set podAnnotations.timestamp=$(date '+%Y-%m-%d-%H:%M:%S') .
